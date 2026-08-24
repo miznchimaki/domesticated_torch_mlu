@@ -1,0 +1,1320 @@
+# All modification made by Cambricon Corporation: © 2022 Cambricon Corporation
+# All rights reserved.
+# All other contributions:
+# Copyright (c) 2014--2022, the respective contributors
+# All rights reserved.
+# For the list of contributors go to https://github.com/pytorch/pytorch/graphs/contributors
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+#     * Redistributions of source code must retain the above copyright notice,
+#       this list of conditions and the following disclaimer.
+#     * Redistributions in binary form must reproduce the above copyright
+#       notice, this list of conditions and the following disclaimer in the
+#       documentation and/or other materials provided with the distribution.
+#     * Neither the name of Intel Corporation nor the names of its contributors
+#       may be used to endorse or promote products derived from this software
+#       without specific prior written permission.
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+# DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE
+# FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+# DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+# SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+# CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+# OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+
+from contextlib import contextmanager
+import threading
+import traceback
+from typing import cast, Tuple, Union, NewType
+import importlib
+from typing import Union, Tuple, Optional, TypeVar, Any, List
+from collections import namedtuple
+import binascii
+import torch
+from torch import device as _device
+from torch._utils import classproperty, _LazySeedTracker
+from torch import device as _device
+import torch_mlu
+
+from ._utils import _get_device_index
+from ._utils import get_implicit_double_to_float
+from .graphs import (
+    MLUGraph,
+    graph,
+    graph_pool_handle,
+    is_current_stream_capturing,
+    make_graphed_callables,
+)
+
+from .streams import Event, ExternalStream, Stream
+from .cncl import *
+from .autocast_utils import *
+from . import amp
+from .storage import *
+from .reductions import apply_reductions_patch
+
+try:
+    from torch_mlu._MLUC import _cnrt
+except ImportError:
+    _cnrt = None
+
+_initialized = False
+_tls = threading.local()
+_initialization_lock = threading.Lock()
+_queued_calls = []  # don't invoke these until initialization occurs
+_is_in_bad_fork = getattr(torch_mlu._MLUC, "_mlu_isInBadFork", lambda: False)
+_device_t = Union[_device, str, int, None]
+
+OutOfMemoryError = torch._C.OutOfMemoryError
+
+_lazy_seed_tracker = _LazySeedTracker()
+
+if hasattr(torch_mlu._MLUC, "_mlu_exchangeDevice"):
+    _exchange_device = torch_mlu._MLUC._mlu_exchangeDevice
+else:
+
+    def _exchange_device(device: int) -> int:
+        if device < 0:
+            return -1
+        raise RuntimeError("PyTorch was compiled without MLU support")
+
+
+if hasattr(torch_mlu._MLUC, "_mlu_maybeExchangeDevice"):
+    _maybe_exchange_device = torch_mlu._MLUC._mlu_maybeExchangeDevice
+else:
+
+    def _maybe_exchange_device(device: int) -> int:
+        if device < 0:
+            return -1
+        raise RuntimeError("PyTorch was compiled without MLU support")
+
+
+class _DeviceGuard:
+    def __init__(self, index: int):
+        self.idx = index
+        self.prev_idx = -1
+
+    def __enter__(self):
+        self.prev_idx = _exchange_device(self.idx)
+
+    def __exit__(self, type: Any, value: Any, traceback: Any):
+        self.idx = _maybe_exchange_device(self.prev_idx)
+        return False
+
+
+class device:
+    r"""Context-manager that changes the selected device.
+
+    Args:
+        device (torch.device or int): device index to select. It's a no-op if
+            this argument is a negative integer or ``None``.
+    """
+
+    def __init__(self, device: Any):
+        self.idx = _get_device_index(device, optional=True)
+        self.prev_idx = -1
+
+    def __enter__(self):
+        self.prev_idx = _exchange_device(self.idx)
+
+    def __exit__(self, type: Any, value: Any, traceback: Any):
+        self.idx = _maybe_exchange_device(self.prev_idx)
+        return False
+
+
+Device = device
+_device_t = Union[_device, str, int, None]
+
+
+### Device management
+def set_device(device: _device_t) -> None:
+    r"""Sets the current device.
+
+    Usage of this function is discouraged in favor of :any:`device`. In most
+    cases it's better to use ``MLU_VISIBLE_DEVICES`` environmental variable.
+
+    Args:
+        device (torch.device or int): selected device. This function is a no-op
+            if this argument is negative.
+    """
+    device = _get_device_index(device, optional=True)
+    if device >= 0:
+        torch_mlu._MLUC._mlu_setDevice(device)
+
+
+def current_device() -> int:
+    r"""Returns the index of a currently selected device."""
+    torch.mlu._lazy_init()
+    return torch_mlu._MLUC._mlu_getDevice()
+
+
+def get_device_properties(device: Optional[_device_t] = None):
+    r"""Gets the properties of a device.
+
+    Args:
+        device (torch.device or int or str): device for which to return the
+            properties of the device.
+
+    Returns:
+        _MLUDeviceProperties: the properties of the device
+    """
+    torch.mlu._lazy_init()
+    device = _get_device_index(device, optional=True)
+    if device < 0 or device >= torch.mlu.device_count():
+        raise AssertionError("Invalid device id")
+    return torch_mlu._MLUC._get_device_properties(device)
+
+
+def get_device_capability(device: Optional[_device_t] = None) -> Tuple[int, int]:
+    r"""Gets the cuda capability of a device.
+
+    Args:
+        device (torch.device or int, optional): device for which to return the
+            device capability. This function is a no-op if this argument is
+            a negative integer. It uses the current device, given by
+            :func:`~torch.mlu.current_device`, if :attr:`device` is ``None``
+            (default).
+
+    Returns:
+        tuple(int, int): the major and minor cuda capability of the device
+    """
+    prop = get_device_properties(device)
+    return prop.major, prop.minor
+
+
+def get_device_name(device: Optional[_device_t] = None) -> str:
+    r"""Gets the name of a device.
+
+    Args:
+        device (torch.device or int, optional): device for which to return the
+            name. This function is a no-op if this argument is a negative
+            integer. It uses the current device, given by :func:`~torch.mlu.current_device`,
+            if :attr:`device` is ``None`` (default).
+
+    Returns:
+        str: the name of the device.
+    """
+    return get_device_properties(device).name
+
+
+def synchronize(device: _device_t = None) -> None:
+    r"""Waits for all kernels in all streams on a MLU device to complete.
+
+    Args:
+        device (torch.device or int, optional): device for which to synchronize.
+            It uses the current device, given by :func:`~torch.mlu.current_device`,
+            if :attr:`device` is ``None`` (default).
+    """
+    torch.mlu._lazy_init()
+    with Device(device):
+        torch_mlu._MLUC._mlu_synchronize()
+
+
+class device_of(device):
+    r"""Context-manager that changes the current device to that of given object.
+
+    You can use tensors as arguments. If a given object is
+    not allocated on a MLU, this is a no-op.
+
+    Args:
+        obj (Tensor or Storage): object allocated on the selected device.
+    """
+
+    def __init__(self, obj):
+        idx = obj.get_device() if obj.device.type == "mlu" else -1
+        super().__init__(idx)
+
+
+def can_device_access_peer(device: _device_t, peer_device: _device_t) -> bool:
+    r"""Checks if peer access between two devices is possible."""
+    torch.mlu._lazy_init()
+    device = _get_device_index(device, optional=True)
+    peer_device = _get_device_index(peer_device)
+    if device < 0 or device >= torch.mlu.device_count():
+        raise AssertionError("Invalid device id")
+    if peer_device < 0 or peer_device >= torch.mlu.device_count():
+        raise AssertionError("Invalid peer device id")
+    return torch_mlu._MLUC._mlu_canDeviceAccessPeer(device, peer_device)
+
+class StreamContext(object):
+    r"""Context-manager that selects a given stream.
+
+    All MLU kernels queued within its context will be enqueued on a selected
+    stream.
+
+    Args:
+        Stream (Stream): selected stream. This manager is a no-op if it's
+            ``None``.
+    .. note:: Streams are per-device.
+    """
+    cur_stream: Optional["torch.mlu.Stream"]
+
+    def __init__(self, stream: Optional["torch.mlu.Stream"]):
+        self.stream = stream
+        self.idx = _get_device_index(None, True)
+        if not torch.jit.is_scripting():
+            if self.idx is None:
+                self.idx = -1
+
+        self.src_prev_stream = (
+            None if not torch.jit.is_scripting() else torch.mlu.default_stream(None)
+        )
+        self.dst_prev_stream = (
+            None if not torch.jit.is_scripting() else torch.mlu.default_stream(None)
+        )
+
+    def __enter__(self):
+        # Local cur_stream variable for type refinement
+        cur_stream = self.stream
+        # Return if stream is None or MLU device not available
+        if cur_stream is None or self.idx == -1:
+            return
+        self.src_prev_stream = torch.mlu.current_stream(None)
+
+        # If the stream is not on the current device, then
+        # set the current stream on the device
+        if self.src_prev_stream.device != cur_stream.device:
+            with torch.mlu.device(cur_stream.device):
+                self.dst_prev_stream = torch.mlu.current_stream(cur_stream.device)
+        torch.mlu.set_stream(cur_stream)
+
+    def __exit__(self, type: Any, value: Any, traceback: Any):
+        # Local cur_stream variable for type refinement
+        cur_stream = self.stream
+        # If stream is None or no MLU device available, return
+        if cur_stream is None or self.idx == -1:
+            return
+
+        # Reset the stream on the original device
+        # and destination device
+        if self.src_prev_stream.device != cur_stream.device:  # type: ignore[union-attr]
+            torch.mlu.set_stream(self.dst_prev_stream)  # type: ignore[arg-type]
+        torch.mlu.set_stream(self.src_prev_stream)  # type: ignore[arg-type]
+
+
+def stream(stream: Optional["torch.mlu.Stream"]) -> StreamContext:
+    return StreamContext(stream)
+
+def _set_stream_by_id(stream_id, device_index, device_type):
+    r"""set stream specified by the stream id, device index and
+        device type
+
+    Args: stream_id (int): stream id in stream pool
+          device_index (int): device index in topo
+          device_type (int): enum device type
+    """
+    torch_mlu._MLUC._mlu_setStream(
+        stream_id=stream_id,
+        device_index=device_index,
+        device_type=device_type,
+    )
+
+
+def set_stream(stream: Stream):
+    r"""Set the current stream.This is a wrapper API to set the stream.
+        Usage of this function is discouraged in favor of the ``stream``
+        context manager.
+
+    Args:
+        stream (Stream): selected stream. This function is a no-op
+            if this argument is ``None``.
+    """
+    if stream is None:
+        return
+    _set_stream_by_id(
+        stream_id=stream.stream_id,
+        device_index=stream.device_index,
+        device_type=stream.device_type,
+    )
+
+
+def _is_compiled() -> bool:
+    r"""Return true if compile with MLU support."""
+    return True
+
+### lazy_init
+def init():
+    r"""Initialize PyTorch's MLU state.
+    """
+    _lazy_init()
+
+def is_initialized():
+    r"""Returns whether PyTorch's MLU state has been initialized."""
+    return _initialized and not _is_in_bad_fork()
+
+def _lazy_call(callable, **kwargs):
+    if is_initialized():
+        callable()
+    else:
+        global _lazy_seed_tracker
+        if kwargs.get("seed_all", False):
+            _lazy_seed_tracker.queue_seed_all(callable, traceback.format_stack())
+        elif kwargs.get("seed", False):
+            _lazy_seed_tracker.queue_seed(callable, traceback.format_stack())
+        else:
+            # Don't store the actual traceback to avoid memory cycle
+            _queued_calls.append((callable, traceback.format_stack()))
+
+def _lazy_init():
+    global _initialized, _queued_calls
+    if is_initialized() or hasattr(_tls, 'is_initializing'):
+        return
+    with _initialization_lock:
+        # We be double-checked locking, boys!  This is OK because
+        # the above test was GIL protected anyway.  The inner test
+        # is for when a thread blocked on some other thread which was
+        # doing the initialization; when they get the lock, they will
+        # find there is nothing left to do.
+        if is_initialized():
+            return
+        # It is important to prevent other threads from entering _lazy_init
+        # immediately, while we are still guaranteed to have the GIL, because some
+        # of the C calls we make below will release the GIL
+        if _is_in_bad_fork():
+            raise RuntimeError(
+                    "Cannot re-initialize MLU in forked subprocess. To use MLU with multiprocessing, you must use the "
+                    "'spawn' start method")
+        torch_mlu._MLUC._mlu_init()
+        # Some of the queued calls may reentrantly call _lazy_init();
+        # we need to just return without initializing in that case.
+        # However, we must not let any *other* threads in!
+        _tls.is_initializing = True
+
+        for calls in _lazy_seed_tracker.get_calls():
+            if calls:
+                _queued_calls.append(calls)
+
+        try:
+            for queued_call, orig_traceback in _queued_calls:
+                try:
+                    queued_call()
+                except Exception as e:
+                    msg = ("MLU call failed lazily at initialization with error: {}\n\n"
+                    "MLU call was originally invoked at:\n\n{}").format(str(e), orig_traceback)
+        finally:
+            delattr(_tls, 'is_initializing')
+        _initialized = True
+
+def cnrt():
+    _lazy_init()
+    return _cnrt
+
+class CnrtError(RuntimeError):
+    def __init__(self, code: int) -> None:
+        msg = _cnrt.mluGetErrorStr(_cnrt.mluError(code))
+        super().__init__(f"{msg} ({code})")
+
+def check_error(res: int) -> None:
+    if res != _cnrt.mluError.success:
+        raise CnrtError(res)
+
+default_generators: Tuple[torch._C.Generator] = []
+
+def _parse_visible_devices():
+    r"""Parse CN_VISIBLE_DEVICES/MLU_VISIBLE_DEVICES environment variable. Keep align with cnrt"""
+    var = os.getenv("CN_VISIBLE_DEVICES")
+
+    if var is None:
+        var = os.getenv("MLU_VISIBLE_DEVICES")
+
+    if var is None:
+        var = os.getenv("CUDA_VISIBLE_DEVICES")
+
+    if var is None:
+        return list(range(64))
+
+    def _strtoul(s: str) -> int:
+        """Return -1 or positive integer sequence string starts with."""
+        if not s:
+            return -1
+        if s.isdigit():
+            return int(s)
+        else:
+            return -1
+
+    def parse_list_from_uuid(lst):
+        rcs = []
+        for elem in lst.split(","):
+            # Repeated id results in empty set
+            if elem in rcs:
+                return []
+            if "-" not in elem:
+                break
+            rcs.append(elem)
+        return rcs
+
+    if "-" in var and len(var) >= 36:
+        return parse_list_from_uuid(var)
+    rc = []
+    for elem in var.split(","):
+        x = _strtoul(elem.strip().lstrip())
+        # Repeated ordinal results in empty set
+        if x in rc:
+            return []
+        # Negative value aborts the sequence
+        if x < 0:
+            break
+        rc.append(x)
+    return rc
+
+def _raw_device_count_cndev():
+    r"""Return number of devices as reported by CNDEV or negative value if CNDEV discovery/initialization failed."""
+    from ctypes import byref, c_int, c_uint, Structure, CDLL
+
+    class CardInfo(Structure):
+        _fields_ = [("version", c_int),
+                    ("number", c_uint)]
+
+    cndev_h = CDLL("libcndev.so")
+    reserved = c_int(0)
+    rc = cndev_h.cndevInit(reserved)
+    if rc != 0:
+        warnings.warn("Can't initialize CNDEV")
+        return -1
+    card_info = CardInfo(6, 0)
+    rc = cndev_h.cndevGetDeviceCount(byref(card_info))
+    if rc != 0:
+        warnings.warn("Can't get cndev device count")
+        return -1
+    del cndev_h
+    return card_info.number
+
+def _transform_uuid_to_ordinals(candidates, uuids):
+    r"""Given the set of partial uuids and list of known uuids builds a set of ordinals excluding ambiguous partials IDs."""
+
+    def uuid_to_orinal(candidate, uuids) -> int:
+        best_match = -1
+        for idx, uuid in enumerate(uuids):
+            if uuid == candidate:
+                best_match = idx
+        return best_match
+
+    rc = []
+    for candidate in candidates:
+        idx = uuid_to_orinal(candidate, uuids)
+        # First invalid ordinal stops parsing
+        if idx < 0:
+            break
+        # Duplicates result in empty set
+        if idx in rc:
+            return []
+        rc.append(idx)
+    return rc
+
+
+def _raw_device_uuid_cndev():
+    r"""Return list of device UUID as reported by CNDEV or None if CNDEV discovery/initialization failed."""
+    from ctypes import byref, c_int, c_uint, c_uint8, c_uint64, CDLL, Structure
+
+    class CardInfo(Structure):
+        _fields_ = [("version", c_int),
+                    ("number", c_uint)]
+
+    class UUID(Structure):
+        _fields_ = [("version", c_int),
+                      ("uuid", c_uint8 * 37),
+                      ("ncsUUID64", c_uint64)]
+
+    cndev_h = CDLL("libcndev.so")
+    reserved = c_int(0)
+    rc = cndev_h.cndevInit(reserved)
+    if rc != 0:
+        warnings.warn("Can't initialize CNDEV")
+        return None
+    card_info = CardInfo(6, 0)
+    rc = cndev_h.cndevGetDeviceCount(byref(card_info))
+    if rc != 0:
+        warnings.warn("Can't get cndev device count")
+        return None
+    uuids = []
+    for idx in range(card_info.number):
+        device_id = c_int()
+        rc = cndev_h.cndevGetDeviceHandleByIndex(idx, byref(device_id))
+        if rc != 0:
+            warnings.warn("Can't get device handle")
+            return None
+        uuid_len = 37
+        buf = c_uint8 * uuid_len
+        uuid = UUID(6, buf(), 0)
+        rc = cndev_h.cndevGetUUID(byref(uuid), device_id)
+        if rc != 0:
+            warnings.warn("Can't get device UUID")
+            return None
+        # uuids.append(str(bytearray(uuid.uuid)))
+        uuids.append(''.join([chr(i) for i in uuid.uuid]).rstrip('\x00'))
+    del cndev_h
+    return uuids
+
+def _device_count_cndev():
+    r"""Return number of devices as reported by CNDEV taking MLU_VISIBLE_DEVICES into account.
+
+    Negative value is returned if CNDEV discovery or initialization has failed.
+    """
+    visible_devices = _parse_visible_devices()
+    if not visible_devices:
+        return 0
+    try:
+        if type(visible_devices[0]) is str:
+            uuids = _raw_device_uuid_cndev()
+            if uuids is None:
+                return -1
+            visible_devices = _transform_uuid_to_ordinals(
+                cast([], visible_devices), uuids
+            )
+        else:
+            raw_cnt = _raw_device_count_cndev()
+            if raw_cnt <= 0:
+                return raw_cnt
+            # Trim the list up to a maximum available device
+            for idx, val in enumerate(visible_devices):
+                if cast(int, val) >= raw_cnt:
+                    return idx
+    except OSError:
+        return -1
+    except AttributeError:
+        return -1
+    return len(visible_devices)
+
+
+
+_cached_device_count = None
+
+def device_count():
+    r"""Return the number of MLUs available."""
+    global _cached_device_count
+    if _cached_device_count is not None:
+        return _cached_device_count
+    cndev_count = _device_count_cndev()
+    r = torch_mlu._MLUC._mlu_getDeviceCount() if cndev_count < 0 else cndev_count
+    # NB: Do not cache the device count prior to MLU initialization, because
+    # the number of devices can change due to changes to MLU_VISIBLE_DEVICES
+    # setting prior to MLU initialization.
+    if _initialized:
+        _cached_device_count = r
+    return r
+
+def _cndev_based_avail():
+    var = os.getenv("PYTORCH_CNDEV_BASED_MLU_CHECK")
+
+    if var is None:
+        var = os.getenv("PYTORCH_NVML_BASED_CUDA_CHECK")
+
+    return var == "1"
+
+
+def is_available():
+    r"""Returns a bool indicating if MLU is currently available."""
+    if _cndev_based_avail():
+        # The user has set an env variable to request this availability check that attempts to avoid fork poisoning by
+        # using CNDEV at the cost of a weaker MLU availability assessment. Note that if CNDEV initialization
+        # fails, this assessment falls back to the default CN Runtime API assessment (`cnrtDeviceCount`)
+        return device_count() > 0
+    else:
+        # This uses the CN Runtime API `cnrtGetDeviceCount` which in turn initializes the MLU Driver
+        # API via `cnInit`
+        return torch_mlu._MLUC._mlu_getDeviceCount() > 0
+
+def _check_cndev_err(ret):
+    if ret != 0:
+        raise RuntimeError("mlu cndev lib invoke failed!")
+    return ret
+
+def _get_cndev_device_index(device: Optional[Union[int, Device]]) -> int:
+    r"""Return the cndev index of the device, taking MLU_VISIBLE_DEVICES into account."""
+    idx = _get_device_index(device, optional=True)
+    visible_devices = _parse_visible_devices()
+    if type(visible_devices[0]) is str:
+        uuids = _raw_device_uuid_cndev()
+        if uuids is None:
+            raise RuntimeError("Can't get device UUIDs")
+        visible_devices = _transform_uuid_to_ordinals(
+            cast(List[str], visible_devices), uuids
+        )
+    visible_devices = cast(List[int], visible_devices)
+    if idx < 0 or idx >= len(visible_devices):
+        raise RuntimeError(
+            f"device {idx} is not visible (MLU_VISIBLE_DEVICES={visible_devices})"
+        )
+    return visible_devices[idx]
+
+def _get_cndev_handler(device, cndev_lib):
+    from ctypes import c_int, byref
+
+    reserved = c_int(0)
+    _check_cndev_err(cndev_lib.cndevInit(reserved))
+    device = _get_cndev_device_index(device)
+    handle = c_int()
+    _check_cndev_err(cndev_lib.cndevGetDeviceHandleByIndex(device, byref(handle)))
+    return handle
+
+def utilization(device: Optional[Union[Device, int]] = None) -> int:
+    r"""Return the percent of time over the past sample period during which one or
+    more kernels was executing on the MLU as given by `cnmon`.
+
+    Args:
+        device (torch.device or int, optional): selected device. Returns
+            statistic for the current device, given by :func:`~torch.mlu.current_device`,
+            if :attr:`device` is ``None`` (default).
+    """
+    from ctypes import byref, c_int, Structure, CDLL
+
+    class UtilizationInfo(Structure):
+        _fields_ = [
+            ("version", c_int),
+            ("averageCoreUtilization", c_int),
+            ("coreUtilization", c_int * 80),
+        ]
+
+    cndev_lib = CDLL("libcndev.so")
+    handle = _get_cndev_handler(device, cndev_lib)
+    util_info = UtilizationInfo(version=6)
+    _check_cndev_err(cndev_lib.cndevGetDeviceUtilizationInfo(byref(util_info), handle))
+    return util_info.averageCoreUtilization
+
+def temperature(device: Optional[Union[Device, int]] = None) -> int:
+    r"""Return the average temperature of the MLU sensor in Degrees C (Centigrades).
+
+    The average temperature is computed based on past sample period as given by `cnmon`.
+
+    Args:
+        device (torch.device or int, optional): selected device. Returns
+            statistic for the current device, given by :func:`~torch.mlu.current_device`,
+            if :attr:`device` is ``None`` (default).
+    """
+    from ctypes import byref, c_int, Structure, CDLL
+
+    class TemperatueInfo(Structure):
+        _fields_ = [
+            ("version", c_int),
+            ("board", c_int),
+            ("cluster", c_int * 20),
+            ("memoryDie", c_int * 8),
+            ("chip", c_int),
+            ("airInlet", c_int),
+            ("airOutlet", c_int),
+            ("memory", c_int),
+            ("videoInput", c_int),
+            ("cpu", c_int),
+            ("isp", c_int),
+        ]
+
+    cndev_lib = CDLL("libcndev.so")
+    handle = _get_cndev_handler(device, cndev_lib)
+    temper_info = TemperatueInfo(version=6)
+    _check_cndev_err(cndev_lib.cndevGetTemperatureInfo(byref(temper_info), handle))
+    return temper_info.chip
+
+def power_draw(device: Optional[Union[Device, int]] = None) -> int:
+    r"""Return the average power draw of the MLU sensor in mW (MilliWatts)
+        over the past sample period as given by `cnmon`.
+
+    Args:
+        device (torch.device or int, optional): selected device. Returns
+            statistic for the current device, given by :func:`~torch.mlu.current_device`,
+            if :attr:`device` is ``None`` (default).
+    """
+    from ctypes import byref, c_int, Structure, CDLL
+
+    class PowerInfo(Structure):
+        _fields_ = [
+            ("usage", c_int),
+            ("cap", c_int),
+            ("machine", c_int),
+            ("tdp", c_int),
+            ("maxPower", c_int),
+            ("reserved", c_int * 16),
+        ]
+
+    cndev_lib = CDLL("libcndev.so")
+    handle = _get_cndev_handler(device, cndev_lib)
+    power_info = PowerInfo()
+    _check_cndev_err(cndev_lib.cndevGetDevicePowerInfo(byref(power_info), handle))
+    return power_info.usage * 1000
+
+# Different with the API description of torch.cuda.clock_rate, we use MHz
+# as the unit of return value, ref https://github.com/pytorch/pytorch/issues/147098.
+def clock_rate(device: Optional[Union[Device, int]] = None) -> int:
+    r"""Return the clock speed of the MLU IPU in MHz (megahertz) over the past sample period as given by `cnmon`.
+
+    Args:
+        device (torch.device or int, optional): selected device. Returns
+            statistic for the current device, given by :func:`~torch.mlu.current_device`,
+            if :attr:`device` is ``None`` (default).
+    """
+    from ctypes import byref, c_int, c_uint8, c_uint16, Structure, CDLL
+
+    class FreqInfo(Structure):
+        _fields_ = [
+            ("version", c_int),
+            ("boardFreq", c_int),
+            ("ddrFreq", c_int),
+            ("overtempDfsFlag", c_uint8),
+            ("fastDfsFlag", c_uint8),
+            ("mluClusterFreqCount", c_uint16),
+            ("mluClusterFreq", c_uint16 * 20),
+            ("boardDefaultFreq", c_int),
+            ("boardFreqArange", c_int * 2),
+        ]
+
+    cndev_lib = CDLL("libcndev.so")
+    handle = _get_cndev_handler(device, cndev_lib)
+    freq_info = FreqInfo(version=6)
+    _check_cndev_err(cndev_lib.cndevGetFrequencyInfo(byref(freq_info), handle))
+    return freq_info.boardFreq
+
+def is_tf32_supported() -> bool:
+    r"""Return a bool indicating if the current MLU device supports dtype tf32."""
+    return True
+
+def is_bf16_supported(including_emulation: bool = True):
+    r"""Returns a bool indicating if MLU is currently support bf16."""
+    return True
+
+def is_fp8_supported(including_emulation: bool = True):
+    r"""Returns a bool indicating if MLU is currently support float8."""
+    return torch.mlu.get_device_properties(torch.mlu.current_device()).major >= 6
+
+def _sleep(cycles):
+    torch_mlu._MLUC._mlu_sleep(cycles)
+
+from .memory import *
+from .random import *
+
+################################################################################
+# Define Storage
+################################################################################
+
+from torch.storage import _LegacyStorage, _warn_typed_storage_removal
+
+class _MluLegacyStorage(_LegacyStorage):
+    @classmethod
+    def from_buffer(cls, *args, **kwargs):
+        _warn_typed_storage_removal()
+        raise RuntimeError('from_buffer: Not available for MLU storage')
+
+    @classmethod
+    def _new_with_weak_ptr(cls, *args, **kwargs):
+        raise RuntimeError('_new_with_weak_ptr: Not available for MLU storage')
+
+    @classmethod
+    def _new_shared_filename(cls, manager, obj, size, *, device=None, dtype=None):
+        raise RuntimeError('_new_shared_filename: Not available for MLU storage')
+
+    @classmethod
+    def _release_ipc_counter(cls, *args, **kwargs):
+        return torch.UntypedStorage._release_ipc_counter_mlu(*args, **kwargs)
+
+class ByteStorage(_MluLegacyStorage):
+    @classproperty
+    def dtype(self):
+        _warn_typed_storage_removal()
+        return self._dtype
+
+    @classproperty
+    def _dtype(self):
+        return torch.uint8
+
+
+class DoubleStorage(_MluLegacyStorage):
+    @classproperty
+    def dtype(self):
+        _warn_typed_storage_removal()
+        return self._dtype
+
+    @classproperty
+    def _dtype(self):
+        return torch.double
+
+
+class FloatStorage(_MluLegacyStorage):
+    @classproperty
+    def dtype(self):
+        _warn_typed_storage_removal()
+        return self._dtype
+
+    @classproperty
+    def _dtype(self):
+        return torch.float
+
+
+class HalfStorage(_MluLegacyStorage):
+    @classproperty
+    def dtype(self):
+        _warn_typed_storage_removal()
+        return self._dtype
+
+    @classproperty
+    def _dtype(self):
+        return torch.half
+
+
+class LongStorage(_MluLegacyStorage):
+    @classproperty
+    def dtype(self):
+        _warn_typed_storage_removal()
+        return self._dtype
+
+    @classproperty
+    def _dtype(self):
+        return torch.long
+
+
+class IntStorage(_MluLegacyStorage):
+    @classproperty
+    def dtype(self):
+        _warn_typed_storage_removal()
+        return self._dtype
+
+    @classproperty
+    def _dtype(self):
+        return torch.int
+
+
+class ShortStorage(_MluLegacyStorage):
+    @classproperty
+    def dtype(self):
+        _warn_typed_storage_removal()
+        return self._dtype
+
+    @classproperty
+    def _dtype(self):
+        return torch.short
+
+
+class CharStorage(_MluLegacyStorage):
+    @classproperty
+    def dtype(self):
+        _warn_typed_storage_removal()
+        return self._dtype
+
+    @classproperty
+    def _dtype(self):
+        return torch.int8
+
+
+class BoolStorage(_MluLegacyStorage):
+    @classproperty
+    def dtype(self):
+        _warn_typed_storage_removal()
+        return self._dtype
+
+    @classproperty
+    def _dtype(self):
+        return torch.bool
+
+
+class BFloat16Storage(_MluLegacyStorage):
+    @classproperty
+    def dtype(self):
+        _warn_typed_storage_removal()
+        return self._dtype
+
+    @classproperty
+    def _dtype(self):
+        return torch.bfloat16
+
+
+class ComplexDoubleStorage(_MluLegacyStorage):
+    @classproperty
+    def dtype(self):
+        _warn_typed_storage_removal()
+        return self._dtype
+
+    @classproperty
+    def _dtype(self):
+        return torch.cdouble
+
+
+class ComplexFloatStorage(_MluLegacyStorage):
+    @classproperty
+    def dtype(self):
+        _warn_typed_storage_removal()
+        return self._dtype
+
+    @classproperty
+    def _dtype(self):
+        return torch.cfloat
+
+del _LegacyStorage
+del _MluLegacyStorage
+
+_mlu_storage_classes = [
+    DoubleStorage, FloatStorage, LongStorage,
+    IntStorage, ShortStorage, CharStorage, ByteStorage,
+    HalfStorage, BoolStorage, BFloat16Storage, ComplexDoubleStorage, ComplexFloatStorage]
+for r in _mlu_storage_classes:
+    torch._storage_classes.add(r)
+
+
+def ipc_collect():
+    r"""Force collects MLU memory after it has been released by MLU IPC.
+
+    .. note::
+        Checks if any sent MLU tensors could be cleaned from the memory. Force
+        closes shared memory file used for reference counting if there is no
+        active counters. Useful when the producer process stopped actively sending
+        tensors and want to release unused memory.
+    """
+    _lazy_init()
+    return torch_mlu._MLUC._mlu_ipc_collect()
+
+def current_stream(device: Optional[_device_t] = None) -> Stream:
+    r"""Returns the currently selected :class:`Stream` for a given device.
+
+    Args:
+        device (torch.device or int, optional): selected device. Returns
+            the currently selected :class:`Stream` for the current device, given
+            by :func:`~torch.mlu.current_device`, if :attr:`device` is ``None``
+            (default).
+    """
+    torch.mlu._lazy_init()
+    streamdata = torch_mlu._MLUC._mlu_getCurrentMLUStream(
+        _get_device_index(device, optional=True)
+    )
+    return Stream(
+        stream_id=streamdata[0], device_index=streamdata[1], device_type=streamdata[2]
+    )
+
+
+def default_stream(device: Optional[_device_t] = None) -> Stream:
+    r"""Returns the default :class:`Stream` for a given device.
+
+    Args:
+        device (torch.device or int, optional): selected device. Returns
+            the default :class:`Stream` for the current device, given by
+            :func:`~torch.mlu.current_device`, if :attr:`device` is ``None``
+            (default).
+    """
+    torch.mlu._lazy_init()
+    streamdata = torch_mlu._MLUC._mlu_getDefaultStream(
+        _get_device_index(device, optional=True)
+    )
+    return Stream(
+        stream_id=streamdata[0], device_index=streamdata[1], device_type=streamdata[2]
+    )
+
+
+StreamInfo = namedtuple("StreamInfo", ["cncl_stream", "clique_id"])
+
+
+def cncl_stream(device: Optional[_device_t] = None) -> List[StreamInfo]:
+    r"""Returns a list of MLU :class:`Stream` used by CNCL for a given device.
+
+    To distinguish between different streams in the list, each stream is
+    bundled with a unique CliqueId into a :namedtuple:`StreamInfo`.
+
+    Args:
+        device (torch.device or int, optional): selected device. Returns
+            a list of  MLU :class:`Stream` used by CNCL for the current device,
+            given by :func:`~torch.mlu.current_device`, if :atta:`device` is
+            ``None``(default)
+
+    Returns:
+        List[StreamInfo]: A list of :namedtuple:`StreamInfo`, each containing:
+            - cncl_stream (Stream): the MLU :class:`Stream` used by CNCL.
+            - clique_id (str): Unique CliqueId bundled with cncl_stream.
+
+    """
+    torch.mlu._lazy_init()
+    streams_data = torch_mlu._MLUC._mlu_getCnclStream(
+        _get_device_index(device, optional=True)
+    )
+    stream_info_list = []
+    for stream_data in streams_data:
+        cncl_stream = Stream(
+            stream_id=stream_data[0],
+            device_index=stream_data[1],
+            device_type=stream_data[2],
+        )
+        clique_id_raw = stream_data[3]
+        clique_id_data = binascii.hexlify(clique_id_raw).decode("utf-8")
+        stream_info_list.append(
+            StreamInfo(cncl_stream=cncl_stream, clique_id=clique_id_data[:16])
+        )
+
+    return stream_info_list
+
+def _get_device(device: Union[int, str, torch.device]) -> torch.device:
+    r"""Return the torch.device type object from the passed in device.
+
+    Args:
+        device (torch.device or int): selected device.
+    """
+    if isinstance(device, str):
+        device = torch.device(device)
+    elif isinstance(device, int):
+        device = torch.device("mlu", device)
+    return device
+
+
+def _get_generator(device: torch.device) -> torch._C.Generator:
+    r"""Return the MLU Generator object for the given device.
+
+    Args:
+        device (torch.device): selected device.
+    """
+    idx = device.index
+    if idx is None:
+        idx = torch.mlu.current_device()
+    return torch.mlu.default_generators[idx]
+
+
+def _set_rng_state_offset(
+    offset: int, device: Union[int, str, torch.device] = "mlu"
+) -> None:
+    r"""Set the random number generator state offset of the specified GPU.
+
+    Args:
+        offset (int): The desired offset
+        device (torch.device or int, optional): The device to set the RNG state.
+            Default: ``'mlu'`` (i.e., ``torch.device('mlu')``, the current MLU device).
+    """
+    final_device = _get_device(device)
+
+    def cb():
+        default_generator = _get_generator(final_device)
+        default_generator.set_offset(offset)
+
+    _lazy_call(cb)
+
+
+def _get_rng_state_offset(device: Union[int, str, torch.device] = "mlu") -> int:
+    r"""Return the random number generator state offset of the specified GPU.
+
+    Args:
+        device (torch.device or int, optional): The device to return the RNG state offset of.
+            Default: ``'mlu'`` (i.e., ``torch.device('mlu')``, the current MLU device).
+
+    .. warning::
+        This function eagerly initializes MLU.
+    """
+    _lazy_init()
+    final_device = _get_device(device)
+    default_generator = _get_generator(final_device)
+    return default_generator.get_offset()
+
+
+def get_precision_supported_op_list() -> List[str]:
+    r"""Returns the list of operators that support precision mode configuration.
+    """
+    return torch_mlu._MLUC._get_precision_supported_op_list()
+
+def module_memory_usage(device: Union[Device, int], mode: int = 0) -> Dict[str, List[int]]:
+    r"""Returns the module memory usage.
+
+    Args:
+        device (torch.device or int): selected device.
+        mode (int, optional): query mode of memory usage, default as 0.
+            0: return the total memory usage of all modules.
+            1: return the detailed memory usage of all modules.
+            2: return the detailed memory usage of all modules and print details on console.
+    """
+    device_index = _get_device_index(device, optional=True)
+    return torch_mlu._MLUC._get_module_memory_usage(device_index, mode)
+
+def get_precision_mode(op_name: str) -> str:
+    r"""Returns the current precision mode of the given operator.
+
+    Operators in ``torch.mlu.get_precision_supported_op_list()`` use high-performance
+    but lower-precision kernels by default ("low" mode). They can be switched to
+    high-precision kernels using ``torch.mlu.set_precision_mode("high", op_name)``.
+
+    For operators not in the supported list, return "high" by default.
+
+    Args:
+        op_name(str): one of operators in ``torch.mlu.get_precision_supported_op_list()``.
+
+    Returns:
+        str: "low" or "high" precision mode.
+
+    """
+    return torch_mlu._MLUC._get_precision_mode(op_name)
+
+
+def set_precision_mode(mode: str, op_name: str = "all_op"):
+    r"""Sets the precision mode for the internal kernel of the given operator.
+
+    Operators in ``torch.mlu.get_precision_supported_op_list()`` use high-performance
+    but lower-precision kernels by default ("low" mode). This function allows switching
+    them between "low" and "high" precision modes.
+
+    - "low": High-performance but lower-precision kernels.
+    - "high": Higher-precision kernels (may have lower performance).
+
+    ``op_name`` supports two cases:
+
+        * one of operators in ``torch.mlu.get_precision_supported_op_list()``
+          returned list.
+        * "all_op", default value, means all operators in the supported list.
+
+    Args:
+        mode(str): precision mode, can be "low" or "high".
+        op_name(str): the operator(s) to be applied with given precision mode,
+          default as "all_op" (means setting for all supported operators).
+
+    Example:
+        >>> torch.mlu.set_precision_mode("high", "silu")  # Switch to high precision
+        >>> torch.mlu.get_precision_mode("silu")
+        'high'
+        >>> torch.mlu.set_precision_mode("low", "silu")  # Switch back to low precision
+        >>> torch.mlu.get_precision_mode("silu")
+        'low'
+
+    """
+    torch_mlu._MLUC._set_precision_mode(mode, op_name)
+
+
+@contextmanager
+def precision_mode(
+    mode: str = "high",
+    op_name: str = "all_op",
+):
+    op_list = get_precision_supported_op_list() if op_name == "all_op" else [op_name]
+    orig_mode_dict = {}
+    for key in op_list:
+        orig_mode_dict[key] = get_precision_mode(key)
+    set_precision_mode(mode, op_name)
+    try:
+        yield
+    finally:
+        # recover the previous mode for given op_name
+        for k,v in orig_mode_dict.items():
+            set_precision_mode(v, k)
+
+
+def __getattr__(name):
+    if name == "Scheduling":
+        from torch_mlu._inductor.codegen.triton import MluTritonScheduling
+        return MluTritonScheduling
+    if name == "PythonWrapperCodegen":
+        from torch_mlu._inductor.codegen.wrapper import PythonWrapperCodegen
+        return PythonWrapperCodegen
+    if name == "CppWrapperCodegen":
+        from torch_mlu._inductor.codegen.cpp_wrapper_mlu import  CppWrapperMlu
+        return CppWrapperMlu
+    if name == "WrapperFxCodegen":
+        from torch._inductor.codegen.wrapper_fxir import WrapperFxCodegen
+        return WrapperFxCodegen
+
+    raise AttributeError(f"module '{__name__}' has no attribute '{name}'")
+
+from . import amp, cnpx, profiler
+
+_POOL_HANDLE = NewType("_POOL_HANDLE", tuple[int, int])
+
+__all__ = [
+    # Typed storage and tensors
+    "BFloat16Storage",
+    "BFloat16Tensor",
+    "BoolStorage",
+    "BoolTensor",
+    "ByteStorage",
+    "ByteTensor",
+    "CharStorage",
+    "CharTensor",
+    "ComplexDoubleStorage",
+    "ComplexFloatStorage",
+    "DoubleStorage",
+    "DoubleTensor",
+    "FloatStorage",
+    "FloatTensor",
+    "HalfStorage",
+    "HalfTensor",
+    "IntStorage",
+    "IntTensor",
+    "LongStorage",
+    "LongTensor",
+    "ShortStorage",
+    "ShortTensor",
+    "Event",
+    "ExternalStream",
+    "Stream",
+    "StreamContext",
+    "amp",
+    "caching_allocator_alloc",
+    "caching_allocator_delete",
+    "caching_allocator_enable",
+    "can_device_access_peer",
+    "check_error",
+    "cnrt",
+    "current_device",
+    "current_stream",
+    "default_generators",
+    "default_stream",
+    "device",
+    "device_count",
+    "device_of",
+    "empty_cache",
+    "get_device_capability",
+    "get_device_name",
+    "get_device_properties",
+    "get_rng_state",
+    "get_rng_state_all",
+    "graph",
+    "graph_pool_handle",
+    "graphs",
+    "init",
+    "initial_seed",
+    "ipc_collect",
+    "is_available",
+    "utilization",
+    "temperature",
+    "power_draw",
+    "clock_rate",
+    "is_bf16_supported",
+    "is_tf32_supported",
+    "is_fp8_supported",
+    "is_current_stream_capturing",
+    "is_initialized",
+    "make_graphed_callables",
+    "manual_seed",
+    "manual_seed_all",
+    "max_memory_allocated",
+    "max_memory_cached",
+    "max_memory_reserved",
+    "mem_get_info",
+    "memory",
+    "memory_allocated",
+    "memory_cached",
+    "memory_reserved",
+    "memory_snapshot",
+    "memory_stats",
+    "memory_stats_as_nested_dict",
+    "memory_summary",
+    "host_memory_stats",
+    "host_memory_stats_as_nested_dict",
+    "reset_accumulated_host_memory_stats",
+    "reset_peak_host_memory_stats",
+    "MLUGraph",
+    "cncl",
+    "cnpx",
+    "random",
+    "reset_accumulated_memory_stats",
+    "reset_max_memory_allocated",
+    "reset_max_memory_cached",
+    "reset_peak_memory_stats",
+    "seed",
+    "seed_all",
+    "set_device",
+    "get_per_process_memory_fraction",
+    "set_per_process_memory_fraction",
+    "set_rng_state",
+    "set_rng_state_all",
+    "set_stream",
+    "stream",
+    "streams",
+    "synchronize",
+    "MLUPluggableAllocator",
+    "change_current_allocator",
+    "profiler",
+    "get_precision_supported_op_list",
+    "get_precision_mode",
+    "set_precision_mode",
+    "precision_mode",
+    "module_memory_usage",
+    "get_implicit_double_to_float",
+]

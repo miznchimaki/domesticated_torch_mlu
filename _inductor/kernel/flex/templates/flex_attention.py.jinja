@@ -1,0 +1,282 @@
+{{def_kernel("Q", "K", "V", "LSE", "MAX", "KV_NUM_BLKS", "KV_IDX", "FULL_KV_NUM_BLKS", "FULL_KV_IDX")}}
+    # Sub notation for this kernel:
+    #
+    # Q: Query, K: Key, V: Value
+    # M: Number of queries, N: Number of keys/values, D: Model dimension
+    # QK_HEAD_DIM: The dimension of the query and key embeddings
+    # V_HEAD_DIM: The dimension of the value embeddings
+    # z: Batch size, h: Number of heads, m: Number of queries per head, k: Number of keys per head
+    # GQA_SHARED_HEADS: number of query heads sharing one kv head in GQA setups.
+    #
+    # The following FULL_* and PARTIAL_* is defined in the block sparse mask grid, rather than the thread block grid.
+    # KV_NUM_BLKS: The number of KV blocks (that may or may not require masking) for each query.
+    # KV_IDX: The indices of KV blocks (that may or may not require masking) for each query.
+    # FULL_KV_NUM_BLKS: The number of fully unmasked KV blocks (so we don't need masking) for each query.
+    # FULL_KV_IDX: The indices of fully unmasked KV blocks (so we don't need masking) for each query.
+    #
+    # OUTPUT_LOGSUMEXP: We only need to store the logsumexp if we require grad
+    #
+    # (Modifiable) Performance tuning options
+    # BLOCK_M: The thread block size across the seqlen dim of Q.
+    # BLOCK_N: Iterate over BLOCK_N across the seqlen dim of K/V in each thread block.
+
+    # The below are kernel options that can be applied for certain score_mods,
+    # or involve a numerics vs. perf tradeoff
+    # PRESCALE_QK: Whether to pre-scale QK by 1/sqrt(d) and change of base. Has
+    # about 20% more numerical error, but slightly faster.
+    # ROWS_GUARANTEED_SAFE: Is it guaranteed that at least one value in each row
+    # is not masked out? If so, we can skip an extra safety check
+    # BLOCKS_ARE_CONTIGUOUS: Is it guaranteed that all blocks in the mask are
+    # contiguous? If so, we don't need to do an indirect jump for every block
+
+    tl.static_assert(SPARSE_Q_BLOCK_SIZE >= BLOCK_M and SPARSE_Q_BLOCK_SIZE % BLOCK_M == 0)
+    tl.static_assert(SPARSE_KV_BLOCK_SIZE >= BLOCK_N and SPARSE_KV_BLOCK_SIZE % BLOCK_N == 0)
+
+    # Define strides of inputs
+    stride_qz, stride_qh, stride_qm, stride_qk = {{stride("Q")}}
+    stride_kz, stride_kh, stride_kn, stride_kk = {{stride("K")}}
+    stride_vz, stride_vh, stride_vn, stride_vk = {{stride("V")}}
+
+    ZQ = {{size("Q", 0)}}
+    HQ = {{size("Q", 1)}}
+    Q_LEN = {{size("Q", 2)}}
+    ZKV = {{size("K", 0)}}
+    KV_LEN = {{size("K", 2)}}
+
+    MATMUL_PRECISION = Q.dtype.element_ty
+
+    # Modify by CAMBRICON
+    # q_start = tl.program_id(0).to(INDEX_DTYPE)
+    # off_zq = tl.program_id(1).to(INDEX_DTYPE)
+    # off_hq = tl.program_id(2).to(INDEX_DTYPE)
+    program_id  = tl.program_id(0)
+    program_dim = tl.num_programs(0)
+
+    context_num = tl.cdiv(Q_LEN, BLOCK_M)
+    total_heads = ZQ * HQ * context_num
+    deal_num_per_core = total_heads // program_dim
+    extra_deal_core_num = total_heads - deal_num_per_core * program_dim
+    deal_num_per_core += 1
+    core_head_begin = program_id * deal_num_per_core
+    if program_id >= extra_deal_core_num:
+        deal_num_per_core -= 1
+        core_head_begin = program_id * deal_num_per_core + extra_deal_core_num
+    if deal_num_per_core <= 0:
+        return
+    head_begin = core_head_begin
+    head_end = head_begin + deal_num_per_core
+
+    for head_idx in range(head_begin, head_end):
+        q_start = (head_idx % context_num).to(INDEX_DTYPE)
+        off_hzq = (head_idx // context_num).to(INDEX_DTYPE)
+        off_zq = (off_hzq // HQ).to(INDEX_DTYPE)
+        off_hq = (off_hzq % HQ).to(INDEX_DTYPE)
+
+        # We support two cases for batch dimension. a) (ZKV == ZQ) where off_zkv = off_zq.
+        # b) (ZKV == 1 and ZQ > 1) where KV is broadcasted along the batch dimension and off_zkv=0.
+        off_zkv = off_zq % ZKV
+        off_hkv = off_hq // GQA_SHARED_HEADS
+        off_g = off_hq % GQA_SHARED_HEADS
+
+        q_offset = off_zq * stride_qz + off_hq * stride_qh
+        k_offset = off_zkv * stride_kz + off_hkv * stride_kh
+        v_offset = off_zkv * stride_vz + off_hkv * stride_vh
+
+        Qq = Q + q_offset
+        Kq = K + k_offset
+        Vq = V + v_offset
+
+        # Setting up the TMA descriptors for Q, K, V
+        # ---- TMA descriptors (rotated for Q and V, normal for K) ----
+        desc_q = None
+        desc_k = None
+        desc_v = None
+        {%- if USE_TMA %}
+        # Modify by CAMBRICON
+        # Q rotated descriptor: logical shape [D, M] == [QK_HEAD_DIM, Q_LEN]
+        # D axis stride is stride_qk, M axis stride is stride_qm
+        # desc_q = tl.make_tensor_descriptor(
+        #     base=Qq,
+        #     shape=[Q_LEN, QK_HEAD_DIM],
+        #     strides=[stride_qm, 1],
+        #     block_shape=[BLOCK_M, QK_HEAD_DIM_ROUNDED],
+        # )
+        desc_q = tl.make_tensor_descriptor(
+            base=Qq,
+            shape=[QK_HEAD_DIM, Q_LEN],
+            strides=[stride_qk, stride_qm],
+            block_shape=[QK_HEAD_DIM_ROUNDED, BLOCK_M],
+        )
+        # end Modify by CAMBRICON
+
+        # K descriptor kept as [N, D] == [KV_LEN, QK_HEAD_DIM]
+        # N axis stride is stride_kn, D axis stride is stride_kk
+        desc_k = tl.make_tensor_descriptor(
+            base=Kq,
+            shape=[KV_LEN, QK_HEAD_DIM],
+            strides=[stride_kn, 1],
+            block_shape=[BLOCK_N, QK_HEAD_DIM_ROUNDED],
+        )
+
+        # Modify by CAMBRICON
+        # V rotated descriptor: logical shape [Dv, N] == [V_HEAD_DIM, KV_LEN]
+        # Dv axis stride is stride_vk, N axis stride is stride_vn
+        # desc_v = tl.make_tensor_descriptor(
+        #     base=Vq,
+        #     shape=[KV_LEN, V_HEAD_DIM],
+        #     strides=[stride_vn, 1],
+        #     block_shape=[BLOCK_N, V_HEAD_DIM_ROUNDED],
+        # )
+        desc_v = tl.make_tensor_descriptor(
+            base=Vq,
+            shape=[V_HEAD_DIM, KV_LEN],
+            strides=[stride_vk, stride_vn],
+            block_shape=[V_HEAD_DIM_ROUNDED, BLOCK_N],
+        )
+        # end Modify by CAMBRICON
+        {%- endif %}
+
+        SPARSE_Z = {{size("KV_NUM_BLKS", 0)}}
+        SPARSE_HQ = {{size("KV_NUM_BLKS", 1)}}
+
+        sparse_idx_z = off_zq % SPARSE_Z
+        sparse_idx_hq = off_hq % SPARSE_HQ
+
+        SPARSE_Q_MULTIPLE: tl.constexpr = (SPARSE_Q_BLOCK_SIZE // BLOCK_M)
+        SPARSE_KV_MULTIPLE: tl.constexpr = (SPARSE_KV_BLOCK_SIZE // BLOCK_N)
+
+        stride_kv_num_blks_h = {{stride("KV_NUM_BLKS", 1)}}
+        stride_kv_idx_h = {{stride("KV_IDX", 1)}}
+        stride_kv_idx_m = {{stride("KV_IDX", 2)}}
+
+        # initialize pointer to m and l
+        m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
+        l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+        # Modify by CAMBRICON: rotated acc: [Dv, M]
+        # acc = tl.zeros([BLOCK_M, V_HEAD_DIM_ROUNDED], dtype=tl.float32)
+        acc = tl.zeros([V_HEAD_DIM_ROUNDED, BLOCK_M], dtype=tl.float32)
+        # end Modify by CAMBRICON
+
+        offs_m = q_start * BLOCK_M + tl.arange(0, BLOCK_M)
+
+        # KV_IDX and KV_NUM_BLKS are always contiguous.
+        sparse_hz_offset = sparse_idx_z * SPARSE_HQ + sparse_idx_hq
+        sparse_kv_num_blks_offset = sparse_hz_offset * stride_kv_num_blks_h + q_start // SPARSE_Q_MULTIPLE
+        sparse_kv_idx_offset = sparse_hz_offset * stride_kv_idx_h + (q_start // SPARSE_Q_MULTIPLE) * stride_kv_idx_m  # noqa: B950
+
+        # ---- load Q as [D, M] ----
+        {%- if USE_TMA %}
+        # Modify by CAMBRICON
+        # q = tl.load_tensor_descriptor(
+        #     desc_q,
+        #     [(q_start * BLOCK_M).to(tl.int32), 0],
+        # )
+        q = tl.load_tensor_descriptor(
+            desc_q,
+            [0, (q_start * BLOCK_M).to(tl.int32)],
+        )  # [D, M] already, no tl.trans
+        # end Modify by CAMBRICON
+        {%- else %}
+        offs_k = tl.arange(0, QK_HEAD_DIM_ROUNDED)
+        # Modify by CAMBRICON
+        # q = load_checked_2d(Qq, offs_m, offs_k, stride_qm, stride_qk, IS_DIVISIBLE, SAFE_HEAD_DIM, Q_LEN, QK_HEAD_DIM)
+        q = load_checked_2d(Qq, offs_k, offs_m, stride_qk, stride_qm, SAFE_HEAD_DIM, IS_DIVISIBLE, QK_HEAD_DIM, Q_LEN)  # [D, M]
+        # end Modify by CAMBRICON
+        {%- endif %}
+
+        # ~~~~~~~~~~~~~~ normal blocks ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # We don't know anything "special" about these blocks, so we need to apply
+        # both score_mod and mask_mod to it
+        kv_indices = KV_IDX + sparse_kv_idx_offset
+        kv_start = tl.load(kv_indices) * SPARSE_KV_BLOCK_SIZE # first kv block we're loading
+        kv_num_blocks = tl.load(KV_NUM_BLKS + sparse_kv_num_blks_offset)
+        block_n_end = tl.minimum(kv_num_blocks * SPARSE_KV_MULTIPLE, tl.maximum(tl.cdiv(KV_LEN, BLOCK_N), 1))
+
+        # K and V pointers will be passed directly to forward_inner
+
+        offs_n = kv_start + tl.arange(0, BLOCK_N)
+
+        acc, l_i, m_i = forward_inner(
+            {{gen_argdefs()}},
+            q, Kq, Vq,
+            desc_k, desc_v, Q_LEN, KV_LEN,
+            acc, l_i, m_i,
+            # Modify by CAMBRICON
+            # off_zq, off_hq, offs_m[:, None], offs_n[None, :],
+            off_zq, off_hq, offs_m, offs_n,
+            # end Modify by CAMBRICON
+            kv_start,
+            kv_indices, kv_num_blocks,
+            0, block_n_end,
+            MATMUL_PRECISION,
+            stride_kk, stride_kn, stride_vn, stride_vk,
+            IS_FULL_BLOCKS=False,
+        )
+
+        # ~~~~~~~~~~~~~~ "full" blocks ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+        # We know these blocks are guaranteed to be "full", so we don't need to
+        # apply mask_mod to them - only score_mod
+        if HAS_FULL_BLOCKS:
+            # FULL_KV_IDX and FULL_KV_NUM_BLKS are always contiguous.
+            kv_indices = FULL_KV_IDX + sparse_kv_idx_offset
+            kv_start = tl.load(kv_indices) * SPARSE_KV_BLOCK_SIZE # first kv block we're loading
+            kv_num_blocks = tl.load(FULL_KV_NUM_BLKS + sparse_kv_num_blks_offset)
+            block_n_end = tl.minimum(kv_num_blocks * SPARSE_KV_MULTIPLE, tl.maximum(tl.cdiv(KV_LEN, BLOCK_N), 1))
+            # K and V pointers will be passed directly to forward_inner
+            offs_n = kv_start + tl.arange(0, BLOCK_N)
+
+            acc, l_i, m_i = forward_inner(
+                {{gen_argdefs()}},
+                q, Kq, Vq,
+                desc_k, desc_v, Q_LEN, KV_LEN,
+                acc, l_i, m_i,
+                # Modify by CAMBRICON
+                # off_zq, off_hq, offs_m[:, None], offs_n[None, :],
+                off_zq, off_hq, offs_m, offs_n,
+                # end Modify by CAMBRICON
+                kv_start,
+                kv_indices, kv_num_blocks,
+                0, block_n_end,
+                MATMUL_PRECISION,
+                stride_kk, stride_kn, stride_vn, stride_vk,
+                IS_FULL_BLOCKS=True,
+            )
+
+        # [Note] Handle fully masked out rows:
+        # Li will be the sum(e^(-inf)) == 0.0 for masked out rows, mi will be -inf.
+        # We set Li to 1.0 which will result in lse/out = 0.0 | after the log(li) + mi(0.0) step
+        l_i = tl.where(l_i == 0.0, 1, l_i)
+
+        # Modify by CAMBRICON
+        # acc: [Dv,M] -> normalize -> transpose in-kernel to store [M,Dv]
+        # acc = acc / l_i[:, None]
+        acc = acc / l_i[None, :]
+        acc = tl.trans(acc)  # NOTE: store-path trans; if this also must be avoided, see note below.
+        idx_zq = off_zq
+        idx_hq = off_hq
+        # end Modify by CAMBRICON
+        idx_m = offs_m[:, None].to(INDEX_DTYPE)
+        idx_d = tl.arange(0, V_HEAD_DIM_ROUNDED)[None, :].to(INDEX_DTYPE)
+
+        mask = (idx_m < Q_LEN) & (idx_d < V_HEAD_DIM)
+
+        tl.static_assert(acc.shape == [BLOCK_M, V_HEAD_DIM_ROUNDED])
+        {{store_output(("idx_zq", "idx_hq", "idx_m", "idx_d"), "acc", "mask",
+                       val_shape=("BLOCK_M", "V_HEAD_DIM_ROUNDED"), indent_width=8)}}
+
+        if OUTPUT_LOGSUMEXP:
+            off_hz = off_zq * HQ + off_hq
+            l_ptrs = LSE + off_hz * Q_LEN + offs_m
+            lse = m_i + tl.math.log2(l_i)
+            if IS_DIVISIBLE:
+                tl.store(l_ptrs, lse)
+            else:
+                tl.store(l_ptrs, lse, mask=offs_m < Q_LEN)
+
+        if OUTPUT_MAX:
+            off_hz = off_zq * HQ + off_hq
+            max_ptrs = MAX + off_hz * Q_LEN + offs_m
+            if IS_DIVISIBLE:
+                tl.store(max_ptrs, m_i)
+            else:
+                tl.store(max_ptrs, m_i, mask=offs_m < Q_LEN)
